@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HiveDocker Node</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#0a0a0c] text-white font-sans flex items-center justify-center min-h-screen">
+
+  <div id="app" class="w-full max-w-md p-6 bg-[#111114] border border-[#27272e] rounded-xl shadow-2xl">
+    <!-- View will be injected here -->
+  </div>
+
+  <script>
+    const app = document.getElementById('app');
+    
+    let state = {
+      nodeId: null,
+      isConnected: false,
+      logs: [],
+      deviceCode: null,
+      userCode: null,
+      verificationUri: null,
+      pollInterval: null
+    };
+
+    async function fetchStatus() {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      state.nodeId = data.nodeId;
+      state.isConnected = data.isConnected;
+      state.logs = data.logs;
+      render();
+    }
+
+    async function startTunnel() {
+      await fetch('/api/tunnel/start', { method: 'POST' });
+      fetchStatus();
+    }
+
+    async function stopTunnel() {
+      await fetch('/api/tunnel/stop', { method: 'POST' });
+      fetchStatus();
+    }
+
+    async function logout() {
+      await fetch('/api/logout', { method: 'POST' });
+      fetchStatus();
+    }
+
+    async function requestAuth() {
+      const res = await fetch('/api/auth/start', { method: 'POST' });
+      const data = await res.json();
+      
+      state.deviceCode = data.data.deviceCode;
+      state.userCode = data.data.userCode;
+      state.verificationUri = data.data.verificationUri;
+      
+      render();
+
+      state.pollInterval = setInterval(async () => {
+        const pollRes = await fetch('/api/auth/poll', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ deviceCode: state.deviceCode })
+        });
+        const pollData = await pollRes.json();
+        if (pollData.data && pollData.data.status === 'success') {
+          clearInterval(state.pollInterval);
+          state.deviceCode = null;
+          fetchStatus(); // Will detect new nodeId
+        }
+      }, 5000);
+    }
+
+    function render() {
+      if (!state.nodeId) {
+        if (!state.deviceCode) {
+          app.innerHTML = \`
+            <h1 class="text-2xl font-bold text-emerald-500 mb-2">HiveDocker</h1>
+            <p class="text-gray-400 mb-6">Registre este container como um nó da rede.</p>
+            <button onclick="requestAuth()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-lg transition-colors">
+              Vincular Dispositivo (Gerar Código)
+            </button>
+          \`;
+        } else {
+          app.innerHTML = \`
+            <h1 class="text-2xl font-bold text-emerald-500 mb-2">Vínculo Necessário</h1>
+            <p class="text-gray-400 mb-4">1. Acesse o painel pelo seu navegador:</p>
+            <a href="\${state.verificationUri}" target="_blank" class="text-blue-400 hover:underline break-all mb-4 block">\${state.verificationUri}</a>
+            <p class="text-gray-400 mb-2">2. Digite o código abaixo:</p>
+            <div class="bg-black border border-gray-800 p-4 rounded-lg text-center mb-4">
+              <span class="text-3xl font-mono text-emerald-400 font-bold">\${state.userCode}</span>
+            </div>
+            <p class="text-xs text-gray-500 text-center animate-pulse">Aguardando aprovação no painel...</p>
+          \`;
+        }
+      } else {
+        app.innerHTML = \`
+          <div class="flex justify-between items-center mb-6">
+            <div>
+              <h1 class="text-xl font-bold text-emerald-500">HiveDocker Node</h1>
+              <p class="text-xs text-gray-500 font-mono">ID: \${state.nodeId}</p>
+            </div>
+            <button onclick="logout()" class="text-red-400 text-sm hover:underline">Desvincular</button>
+          </div>
+          
+          <div class="bg-gray-900 border \${state.isConnected ? 'border-emerald-500' : 'border-gray-800'} rounded-lg p-4 mb-6 text-center">
+            <h2 class="text-lg font-bold mb-1 \${state.isConnected ? 'text-emerald-400' : 'text-gray-400'}">
+              \${state.isConnected ? 'Túnel Conectado e Operante' : 'Túnel Desligado'}
+            </h2>
+          </div>
+
+          <button onclick="\${state.isConnected ? 'stopTunnel()' : 'startTunnel()'}" class="w-full \${state.isConnected ? 'bg-red-500 hover:bg-red-600' : 'bg-emerald-600 hover:bg-emerald-500'} text-white font-bold py-3 rounded-lg transition-colors mb-6">
+            \${state.isConnected ? 'Desligar Túnel' : 'Ligar Túnel'}
+          </button>
+
+          <div>
+            <h3 class="text-sm font-bold text-gray-400 mb-2">Logs ao Vivo</h3>
+            <div class="bg-black border border-gray-800 rounded-lg p-3 h-48 overflow-y-auto text-xs font-mono text-gray-400">
+              \${state.logs.map(l => \`<div>\${l}</div>\`).join('') || '<div>Nenhum tráfego ainda...</div>'}
+            </div>
+          </div>
+        \`;
+      }
+    }
+
+    // Initial load
+    fetchStatus();
+    setInterval(fetchStatus, 2000);
+  </script>
+</body>
+</html>
