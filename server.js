@@ -11,7 +11,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
-let config = { serverIp: 'api.hivenode.alfastage.com.br', nodeId: null, linkToken: null };
+let config = { serverIp: 'api.hivenode.alfastage.com.br', nodeId: null, linkToken: null, tunnelSecret: null };
 try {
   if (fs.existsSync(CONFIG_FILE)) {
     config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -44,7 +44,7 @@ function startTunnel() {
     ws.close();
   }
 
-  const hmacSig = CryptoJS.HmacSHA256(config.nodeId, "hivenode_secret_key").toString(CryptoJS.enc.Hex);
+  const hmacSig = CryptoJS.HmacSHA256(config.nodeId, config.tunnelSecret || "hivenode_secret_key").toString(CryptoJS.enc.Hex);
   const wsUrl = \`wss://\${config.serverIp}/tunnel?nodeId=\${config.nodeId}&sig=\${hmacSig}\`;
 
   addLog("Conectando ao Broker...");
@@ -187,10 +187,38 @@ app.post('/api/auth/poll', async (req, res) => {
     const data = await response.json();
     
     if (data.status === 'success' && data.token) {
-      // Mock node id registration (in reality the device should register to /nodes but we will just generate a local id for now)
-      config.linkToken = data.token;
-      config.nodeId = 'DOCKER-' + Math.random().toString(36).substring(2, 10).toUpperCase();
-      saveConfig();
+      // Exchange linkToken for JWT & tunnelSecret
+      const loginRes = await fetch(\`https://\${config.serverIp}/api/auth/qr-login\`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ linkToken: data.token })
+      });
+      const loginData = await loginRes.json();
+
+      if (loginRes.ok && loginData.data) {
+        config.linkToken = loginData.data.token; // Now it's the JWT
+        config.tunnelSecret = loginData.data.user.tunnelSecret;
+
+        // Register Node
+        const nodeRes = await fetch(\`https://\${config.serverIp}/api/nodes\`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': \`Bearer \${config.linkToken}\`
+          },
+          body: JSON.stringify({ deviceName: "HiveDocker", visibility: "PUBLIC" })
+        });
+        const nodeData = await nodeRes.json();
+
+        if (nodeRes.ok && nodeData.data && nodeData.data.node) {
+          config.nodeId = nodeData.data.node.id;
+          saveConfig();
+        } else {
+          throw new Error("Erro ao registrar Node no HiveNode API");
+        }
+      } else {
+        throw new Error("Falha ao validar sessão");
+      }
     }
     
     res.json(data);
