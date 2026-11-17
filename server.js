@@ -1,401 +1,158 @@
 const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
-const WebSocket = require('ws');
-const CryptoJS = require('crypto-js');
-const net = require('node:net');
-const { parseHostPort, isHostSafe } = require('./hostValidator');
-
-const app = express();
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-const CONFIG_FILE = path.join(__dirname, 'config.json');
-
-let config = { serverIp: 'api.hivenode.alfastage.com.br', nodeId: null, linkToken: null, tunnelSecret: null };
-try {
-  if (fs.existsSync(CONFIG_FILE)) {
-    config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  }
-} catch (e) { console.error('Error reading config', e); }
-
-function saveConfig() {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-}
-
 const crypto = require('node:crypto');
+const net = require('node:net');
+const WebSocket = require('ws');
+const { resolveTarget } = require('./hostValidator');
 
-function ensurePanelToken() {
-  if (!config.panelToken) {
-    config.panelToken = crypto.randomBytes(24).toString('hex');
-    saveConfig();
-    addLog(`🔑 Novo token de painel gerado: ${config.panelToken.slice(0, 8)}...`);
+function createNode(options = {}) {
+  const configFile = options.configFile || process.env.CONFIG_FILE || path.join(__dirname, 'data', 'config.json');
+  let config = {};
+  try { config = JSON.parse(fs.readFileSync(configFile, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  config.panelToken ||= process.env.PANEL_TOKEN || crypto.randomBytes(32).toString('hex');
+  config.installationId ||= crypto.randomUUID();
+  const webBase = options.webBase || process.env.WEB_BASE || 'https://hivenode.alfastage.com.br';
+  const brokerBase = options.brokerBase || process.env.BROKER_URL || 'wss://api.hivenode.alfastage.com.br';
+  const visibility = options.visibility || process.env.NODE_VISIBILITY || 'PUBLIC';
+  if (!['PUBLIC', 'PRIVATE'].includes(visibility)) throw new Error('Invalid NODE_VISIBILITY');
+  const allowPrivate = process.env.APP_ENV === 'test' && process.env.ALLOW_PRIVATE_TARGETS === 'true';
+  const save = () => {
+    fs.mkdirSync(path.dirname(configFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(`${configFile}.tmp`, JSON.stringify(config), { mode: 0o600 });
+    fs.renameSync(`${configFile}.tmp`, configFile);
+  };
+  save();
+  let session = null;
+  let reconnectTimer = null;
+  let attempts = 0;
+  let stopped = true;
+  let pollBusy = false;
+  let authGeneration = 0;
+  const resolveDestination = options.resolveTarget || resolveTarget;
+  const logs = [];
+  function log(message) { logs.unshift({ time: new Date().toISOString(), message }); logs.splice(50); }
+  function send(s, payload) {
+    if (s.ws.readyState === WebSocket.OPEN) s.ws.send(typeof payload === 'object' && !Buffer.isBuffer(payload) ? JSON.stringify(payload) : payload);
   }
-}
-ensurePanelToken();
-
-function requireToken(req, res, next) {
-  if (process.env.HIVEDOCKER_PUBLIC === 'true') return next();
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (token !== config.panelToken) {
-    return res.status(401).json({ error: 'Acesso não autorizado' });
-  }
-  next();
-}
-
-app.use('/api/tunnel', requireToken);
-app.use('/api/logout', requireToken);
-app.use('/api/auth', requireToken);
-
-let ws = null;
-let isConnected = false;
-const logs = [];
-let tunnelStartTime = null;
-let retryCount = 0;
-let reconnectTimer = null;
-let intentionalStop = false;
-let telemetryInterval = null;
-
-function addLog(msg) {
-  const time = new Date().toLocaleTimeString();
-  const logStr = `[${time}] ${msg}`;
-  logs.unshift(logStr);
-  if (logs.length > 100) logs.pop();
-  console.log(logStr);
-  
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ type: "LOG", payload: msg }));
-  }
-  
-  if (typeof broadcastUpdate === 'function') {
-    broadcastUpdate();
-  }
-}
-
-function scheduleReconnect() {
-  if (intentionalStop) return;
-  
-  const baseDelay = Math.min(1000 * (2 ** retryCount), 30000);
-  const jitter = baseDelay * 0.2 * (Math.random() - 0.5);
-  const delay = Math.floor(baseDelay + jitter);
-  
-  addLog(`⏳ Reconnect em ${Math.round(delay/1000)}s...`);
-  reconnectTimer = setTimeout(() => {
-    retryCount += 1;
-    startTunnel();
-  }, delay);
-}
-
-function startTunnel() {
-  if (!config.nodeId) {
-    addLog("Erro: Aparelho não vinculado");
-    return;
-  }
-  intentionalStop = false;
-  retryCount = 0;
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  
-  if (ws) {
-    ws.close();
-  }
-  if (typeof broadcastUpdate === 'function') broadcastUpdate();
-
-  const hmacSig = CryptoJS.HmacSHA256(config.nodeId, config.tunnelSecret).toString(CryptoJS.enc.Hex);
-  const wsUrl = `wss://${config.serverIp}/tunnel?nodeId=${config.nodeId}&sig=${hmacSig}`;
-
-  addLog("Conectando ao Broker...");
-  ws = new WebSocket(wsUrl, {
-    pingInterval: 30000,
-    pingTimeout: 10000,
-  });
-  
-  const activeSockets = {};
-
-  ws.on('open', () => {
-    isConnected = true;
-    tunnelStartTime = Date.now();
-    retryCount = 0;
-    addLog("✅ Túnel TCP Reverso Conectado!");
-    
-    telemetryInterval = setInterval(() => {
-      if (!ws || ws.readyState !== 1) return;
-      const uptime = tunnelStartTime ? Math.floor((Date.now() - tunnelStartTime) / 1000) : 0;
-      ws.send(JSON.stringify({
-        type: "TELEMETRY",
-        network: "DATACENTER",
-        uptime: uptime
-      }));
-    }, 30000);
-  });
-
-  ws.on('message', (data, isBinary) => {
-    if (isBinary) {
-      // Handle TCP Traffic
-      if (data.length < 1) return;
-      const idLen = data[0];
-      if (data.length < 1 + idLen) return;
-      
-      const connIdBytes = data.slice(1, 1 + idLen);
-      let connId = "";
-      for (let i = 0; i < connIdBytes.length; i++) connId += String.fromCharCode(connIdBytes[i]);
-      const payload = data.slice(1 + idLen);
-      
-      if (activeSockets[connId]) {
-        activeSockets[connId].write(payload);
-      }
-      return;
-    }
-
-    // JSON Control
-    try {
-      const msg = JSON.parse(data.toString());
-      const { connId, type, host } = msg;
-
-      if (type === "NODE_RENAMED" && msg.newName) {
-        config.nodeName = msg.newName;
-        saveConfig();
-        addLog(`✏️ Aparelho renomeado pelo painel: ${msg.newName}`);
+  function status() { return { nodeId: config.nodeId || null, nodeName: config.nodeName || 'HiveDocker',
+    isConnected: session?.ws.readyState === WebSocket.OPEN, uptime: session?.started ? Math.floor((Date.now() - session.started) / 1000) : 0,
+    retryCount: attempts, logs }; }
+  function start() {
+    if (session || !config.nodeId || !config.tunnelSecret) return;
+    stopped = false;
+    clearTimeout(reconnectTimer);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const sig = crypto.createHmac('sha256', config.tunnelSecret).update(`${config.nodeId}:${timestamp}`).digest('hex');
+    const ws = new WebSocket(`${brokerBase}/tunnel?nodeId=${config.nodeId}&ts=${timestamp}&sig=${sig}`, { maxPayload: 1048576, handshakeTimeout: 10000 });
+    const s = { ws, sockets: new Map(), started: null, telemetry: null, pending: new Map() };
+    session = s;
+    ws.on('open', () => {
+      attempts = 0; s.started = Date.now(); log('Túnel conectado');
+      s.telemetry = setInterval(() => send(s, { type: 'TELEMETRY', network: 'DATACENTER', uptime: Math.floor((Date.now() - s.started) / 1000) }), 30000);
+    });
+    ws.on('message', async (data, binary) => {
+      if (binary) {
+        const length = data[0];
+        if (!length || data.length < 1 + length) return;
+        const socket = s.sockets.get(data.subarray(1, 1 + length).toString());
+        if (socket) {
+          if (socket.writableLength > 1048576) { socket.destroy(); return; }
+          socket.write(data.subarray(1 + length));
+        }
         return;
       }
-
-      if (type === "DIAL") {
-        addLog(`[${connId}] Requisição TCP -> ${host}`);
-        const { host: targetHost, port: targetPort } = parseHostPort(host, 443);
-        
-        if (!isHostSafe(targetHost)) {
-          addLog(`❌ [${connId}] Host bloqueado: ${targetHost}`);
-          ws.send(JSON.stringify({ connId, type: "DIAL_ERR" }));
-          return;
-        }
-        
-        const client = new net.Socket();
-        
-        client.connect(targetPort, targetHost, () => {
-          ws.send(JSON.stringify({ connId, type: "DIAL_OK" }));
+      let message;
+      try { message = JSON.parse(data.toString()); } catch { return; }
+      const { type, connId, host } = message;
+      if (type === 'NODE_RENAMED') { config.nodeName = String(message.newName).slice(0, 100); save(); return; }
+      if (type === 'CLOSE') { const pending = s.pending.get(connId); if (pending) pending.cancelled = true; s.sockets.get(connId)?.destroy(); return; }
+      if (type !== 'DIAL' || typeof connId !== 'string' || !/^[a-zA-Z0-9-]{1,64}$/.test(connId) || s.sockets.has(connId) || s.pending.has(connId)) return;
+      if (s.sockets.size + s.pending.size >= 64) { send(s, { type: 'DIAL_ERR', connId }); return; }
+      const pending = { cancelled: false };
+      s.pending.set(connId, pending);
+      try {
+        const destination = await resolveDestination(host, allowPrivate);
+        if (pending.cancelled || session !== s || ws.readyState !== WebSocket.OPEN) return;
+        const socket = net.createConnection(destination);
+        s.sockets.set(connId, socket);
+        socket.setTimeout(120000, () => socket.destroy());
+        socket.on('connect', () => send(s, { type: 'DIAL_OK', connId }));
+        socket.on('data', buffer => {
+          if (ws.bufferedAmount > 1048576) { socket.destroy(); return; }
+          const id = Buffer.from(connId);
+          send(s, Buffer.concat([Buffer.from([id.length]), id, buffer]));
         });
-
-        client.on('data', (buffer) => {
-          const idBytes = Buffer.from(connId, 'utf-8');
-          const outBuffer = Buffer.alloc(1 + idBytes.length + buffer.length);
-          outBuffer[0] = idBytes.length;
-          idBytes.copy(outBuffer, 1);
-          buffer.copy(outBuffer, 1 + idBytes.length);
-          ws.send(outBuffer);
-        });
-
-        client.on('error', (err) => {
-          addLog(`❌ [${connId}] Erro TCP: ${err.message}`);
-          ws.send(JSON.stringify({ connId, type: "DIAL_ERR" }));
-        });
-
-        client.on('close', () => {
-          ws.send(JSON.stringify({ connId, type: "CLOSE" }));
-          delete activeSockets[connId];
-        });
-
-        activeSockets[connId] = client;
-      } else if (type === "CLOSE") {
-        if (activeSockets[connId]) {
-          activeSockets[connId].destroy();
-          delete activeSockets[connId];
-        }
+        socket.on('error', () => send(s, { type: 'DIAL_ERR', connId }));
+        socket.on('close', () => { s.sockets.delete(connId); send(s, { type: 'CLOSE', connId }); });
+      } catch { send(s, { type: 'DIAL_ERR', connId }); }
+      finally { if (s.pending.get(connId) === pending) s.pending.delete(connId); }
+    });
+    ws.on('error', () => log('Falha de conexão com o broker'));
+    ws.on('close', (_code, reason) => {
+      clearInterval(s.telemetry);
+      for (const socket of s.sockets.values()) socket.destroy();
+      if (session !== s) return;
+      session = null;
+      if (reason.toString() === 'KICKED') { stopped = true; log('Acesso revogado pelo painel'); }
+      if (!stopped) {
+        const delay = Math.min(30000, 1000 * 2 ** attempts++) + Math.floor(Math.random() * 500);
+        reconnectTimer = setTimeout(start, delay);
       }
-    } catch (e) {
-      addLog(`Erro pacotes JSON: ${e.message}`);
-    }
-  });
-
-  ws.on('close', (_code, reason) => {
-    if (telemetryInterval) clearInterval(telemetryInterval);
-    isConnected = false;
-    tunnelStartTime = null;
-    Object.values(activeSockets).forEach(s => { s.destroy(); });
-    ws = null;
-    
-    const reasonStr = reason ? reason.toString('utf8') : '';
-    
-    if (reasonStr === 'KICKED') {
-      addLog('🔨 Este nó foi removido pelo painel. Limpando credenciais...');
-      config.nodeId = null;
-      config.token = null;
-      config.linkToken = null;
-      saveConfig();
-      return;
-    }
-    
-    addLog('🛑 Túnel Desconectado.');
-    scheduleReconnect();
-  });
-
-  ws.on('error', (e) => {
-    addLog(`❌ Erro WebSocket: ${e.message}`);
-  });
-}
-
-function stopTunnel() {
-  intentionalStop = true;
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (telemetryInterval) clearInterval(telemetryInterval);
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
-  if (typeof broadcastUpdate === 'function') broadcastUpdate();
-}
-
-// API Routes
-app.get('/api/status', (_req, res) => {
-  res.json({
-    nodeId: config.nodeId,
-    nodeName: config.nodeName,
-    isConnected,
-    uptime: tunnelStartTime ? Math.floor((Date.now() - tunnelStartTime) / 1000) : 0,
-    logs: logs.slice(0, 20)
-  });
-});
-
-app.post('/api/tunnel/start', (_req, res) => {
-  startTunnel();
-  res.json({ success: true });
-});
-
-app.post('/api/tunnel/stop', (_req, res) => {
-  stopTunnel();
-  res.json({ success: true });
-});
-
-// A simple local device-code flow
-app.post('/api/auth/start', async (_req, res) => {
-  try {
-    const response = await fetch(`https://${config.serverIp}/api/auth/device-code/generate`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({type: 'miner'})
     });
-    const data = await response.json();
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({error: e.message});
   }
-});
-
-app.post('/api/auth/poll', async (req, res) => {
-  try {
-    const { deviceCode } = req.body;
-    
-    // 1. Poll status pending/approved
-    const pollRes = await fetch(`https://${config.serverIp}/api/auth/device-code/poll`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ deviceCode })
-    });
-    const pollData = await pollRes.json();
-    
-    if (pollData.data?.status !== 'success' || !pollData.data.token) {
-      // ainda pending
-      return res.json({ status: 'pending' });
-    }
-    
-    // 2. Troca linkToken (5 min) por JWT de sessão (7 dias)
-    const loginRes = await fetch(`https://${config.serverIp}/api/auth/qr-login`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ linkToken: pollData.data.token })
-    });
-    const loginData = await loginRes.json();
-    if (!loginData.data?.token) throw new Error('Troca por JWT falhou');
-    const jwt = loginData.data.token;
-    
-    // 3. Cria Node REAL no banco
-    const nodeRes = await fetch(`https://${config.serverIp}/api/nodes`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${jwt}`
-      },
-      body: JSON.stringify({ deviceName: 'HiveDocker', visibility: 'PUBLIC' })
-    });
-    const nodeData = await nodeRes.json();
-    if (!nodeData.data?.node?.id) throw new Error(`Falha ao criar node: ${nodeData.error || ''}`);
-    
-    // 4. Persistir
-    config.linkToken = null; // linkToken já foi trocado
-    config.token = jwt;
-    config.tunnelSecret = loginData.data.user?.tunnelSecret || "hivenode_secret_key";
-    config.nodeId = nodeData.data.node.id;
-    saveConfig();
-    
-    res.json({ status: 'success' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+  function stop() { stopped = true; clearTimeout(reconnectTimer); const previous = session; session = null; if (previous) { previous.ws.terminate(); for (const socket of previous.sockets.values()) socket.destroy(); } }
+  async function api(route, body, token) {
+    const response = await fetch(`${webBase}/api${route}`, { method: 'POST', headers: {
+      'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'API unavailable');
+    return result.data;
   }
-});
-
-
-app.post('/api/logout', (_req, res) => {
-  stopTunnel();
-  config.nodeId = null;
-  config.linkToken = null;
-  saveConfig();
-  res.json({ success: true });
-});
-
-let server;
-
-function gracefulShutdown(signal) {
-  addLog(`🛑 ${signal} recebido. Encerrando graciosamente...`);
-  
-  if (ws) {
-    ws.close();
-    ws = null;
-  }
-  
-  if (server) {
-    server.close(() => {
-      addLog('✅ Shutdown completo');
-      process.exit(0);
-    });
-    
-    setTimeout(() => process.exit(1), 5000).unref();
-  }
-}
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-server = app.listen(8080, '0.0.0.0', () => {
-  console.log('HiveDocker running on http://0.0.0.0:8080');
-});
-
-function getStatusData() {
-  return {
-    nodeId: config.nodeId,
-    nodeName: config.nodeName,
-    isConnected,
-    uptime: tunnelStartTime ? Math.floor((Date.now() - tunnelStartTime) / 1000) : 0,
-    logs: logs.slice(0, 20)
-  };
-}
-
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (client, req) => {
-  // Opcional: proteger o WS tb
-  const url = new URL(req.url, 'http://localhost');
-  const token = url.searchParams.get('token');
-  if (process.env.HIVEDOCKER_PUBLIC !== 'true' && token !== config.panelToken) {
-    client.close(4001, "Unauthorized");
-    return;
-  }
-  
-  client.send(JSON.stringify({ type: 'status', data: getStatusData() }));
-});
-
-function broadcastUpdate() {
-  if (!wss) return;
-  const payload = JSON.stringify({ type: 'status', data: getStatusData() });
-  wss.clients.forEach((c) => {
-    if (c.readyState === 1) c.send(payload);
+  const app = express();
+  app.disable('x-powered-by');
+  app.use(express.json({ limit: '16kb' }));
+  app.use(express.static(path.join(__dirname, 'public')));
+  app.use('/api', (req, res, next) => {
+    const supplied = req.headers.authorization?.replace(/^Bearer /, '') || '';
+    if (Buffer.byteLength(supplied) !== Buffer.byteLength(config.panelToken) || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(config.panelToken))) return res.status(401).json({ error: 'Token do painel inválido' });
+    next();
   });
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+  app.get('/api/status', (_req, res) => res.json(status()));
+  app.post('/api/tunnel/start', (_req, res) => { start(); res.json({ success: true }); });
+  app.post('/api/tunnel/stop', (_req, res) => { stop(); res.json({ success: true }); });
+  app.post('/api/logout', (_req, res) => { authGeneration++; stop(); delete config.nodeId; delete config.tunnelSecret; delete config.token; delete config.linkToken; save(); res.json({ success: true }); });
+  app.post('/api/auth/start', async (_req, res) => {
+    try { res.json({ success: true, data: await api('/auth/device-code/generate', { type: visibility === 'PUBLIC' ? 'miner' : 'proxy' }) }); }
+    catch (error) { res.status(502).json({ error: error.message }); }
+  });
+  app.post('/api/auth/poll', async (req, res) => {
+    if (pollBusy) return res.json({ data: { status: 'pending' } });
+    pollBusy = true;
+    const generation = authGeneration;
+    try {
+      if (config.nodeId) return res.json({ data: { status: 'success' } });
+      const poll = await api('/auth/device-code/poll', { deviceCode: req.body.deviceCode });
+      if (poll.status !== 'success') return res.json({ data: { status: 'pending' } });
+      const login = await api('/auth/qr-login', { linkToken: poll.token });
+      const registered = await api('/nodes', { deviceName: 'HiveDocker', visibility, installationId: config.installationId }, login.token);
+      if (generation !== authGeneration) return res.status(409).json({ error: 'Vínculo cancelado' });
+      if (!registered.tunnelSecret) throw new Error('Missing device credential');
+      config.nodeId = registered.node.id; config.tunnelSecret = registered.tunnelSecret; save(); start();
+      res.json({ data: { status: 'success' } });
+    } catch (error) { res.status(502).json({ error: error.message }); }
+    finally { pollBusy = false; }
+  });
+  return { app, start, stop, status, panelToken: config.panelToken };
 }
+if (require.main === module) {
+  const node = createNode();
+  const server = node.app.listen(Number(process.env.PORT || 8080), process.env.HOST || '127.0.0.1', () => {
+    console.log('HiveDocker ready. Panel token is stored in data/config.json (or PANEL_TOKEN).');
+    node.start();
+  });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { node.stop(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); });
+}
+module.exports = { createNode };

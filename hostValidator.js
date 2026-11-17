@@ -1,25 +1,33 @@
-const PRIVATE_RANGES = [/^127\./, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./, /^::1$/];
-
-function isHostSafe(host, allowPrivate = false) {
-  if (!host || host.length > 253) return false;
-  if (/\s|[<>"'`]/.test(host)) return false; // sem meta chars
-  if (host.startsWith("/") || host.startsWith("\\") || host.includes("..")) return false;
-  if (host === "localhost") return allowPrivate;
-  if (!allowPrivate) {
-    return !PRIVATE_RANGES.some(rx => rx.test(host));
+const net = require('node:net');
+const dns = require('node:dns').promises;
+function isHostSafe(host) {
+  if (!net.isIP(host)) return false;
+  const ip = host.toLowerCase();
+  if (net.isIP(ip) === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127));
   }
-  return true;
-}
-
-function parseHostPort(addr, defaultPort = 443) {
-  // addr = "host:port" ou "host"
-  const parts = addr.split(":");
-  const host = parts[0];
-  const port = parts.length > 1 ? parseInt(parts[1], 10) : defaultPort;
-  if (!Number.isFinite(port) || port < 1 || port > 65535) {
-    return { host, port: defaultPort };
+  const normalized = new URL('http://[' + ip + ']/').hostname.slice(1, -1);
+  if (normalized.startsWith('::ffff:')) {
+    const words = normalized.slice(7).split(':').map(s => parseInt(s, 16));
+    return words.length === 2 && isHostSafe([words[0] >> 8, words[0] & 255, words[1] >> 8, words[1] & 255].join('.'));
   }
-  return { host, port };
+  return /^[23]/.test(normalized) && !normalized.startsWith('2002:') &&
+    !normalized.startsWith('2001:db8:') && !normalized.startsWith('2001::');
 }
-
-module.exports = { isHostSafe, parseHostPort };
+function parseHostPort(address) {
+  if (typeof address !== 'string') throw new Error('Invalid destination');
+  const match = /^(?:\[([^\]]+)\]|([^:]+)):(\d+)$/.exec(address);
+  if (!match) throw new Error('Invalid destination');
+  const port = Number(match[3]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
+  return { host: match[1] || match[2], port };
+}
+async function resolveTarget(address, allowPrivate = false) {
+  const { host, port } = parseHostPort(address);
+  const addresses = await dns.lookup(host, { all: true });
+  if (!addresses.length || (!allowPrivate && addresses.some(a => !isHostSafe(a.address)))) throw new Error('Private destination blocked');
+  return { host: addresses[0].address, port, family: addresses[0].family };
+}
+module.exports = { isHostSafe, parseHostPort, resolveTarget };
