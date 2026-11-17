@@ -1,11 +1,18 @@
-version: '3.8'
-
 services:
   hivedocker:
     build: .
     container_name: hivedocker
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${PANEL_BIND:-127.0.0.1}:${PANEL_PORT:-8080}:8080"
     volumes:
-      - ./config.json:/app/config.json
+      - hivedocker_data:/app/data
+    environment:
+      NODE_VISIBILITY: ${NODE_VISIBILITY:-PUBLIC}
+      HOST: 0.0.0.0
+      WEB_BASE: ${WEB_BASE:-https://hivenode.alfastage.com.br}
+      BROKER_URL: ${BROKER_URL:-wss://api.hivenode.alfastage.com.br}
+      PANEL_TOKEN: ${PANEL_TOKEN:?Set PANEL_TOKEN}
+
+volumes:
+  hivedocker_data:
