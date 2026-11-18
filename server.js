@@ -29,6 +29,8 @@ function createNode(options = {}) {
   let stopped = true;
   let pollBusy = false;
   let authGeneration = 0;
+  let pending = null;
+  let autoTimer = null;
   const resolveDestination = options.resolveTarget || resolveTarget;
   const logs = [];
   function log(message) { logs.unshift({ time: new Date().toISOString(), message }); logs.splice(50); }
@@ -37,7 +39,8 @@ function createNode(options = {}) {
   }
   function status() { return { nodeId: config.nodeId || null, nodeName: config.nodeName || 'HiveDocker',
     isConnected: session?.ws.readyState === WebSocket.OPEN, uptime: session?.started ? Math.floor((Date.now() - session.started) / 1000) : 0,
-    retryCount: attempts, logs }; }
+    retryCount: attempts, logs, pendingCode: pending?.userCode || null,
+    verificationUri: pending?.verificationUri || null }; }
   function start() {
     if (session || !config.nodeId || !config.tunnelSecret) return;
     stopped = false;
@@ -110,6 +113,49 @@ function createNode(options = {}) {
     if (!response.ok || !result.success) throw new Error(result.error || 'API unavailable');
     return result.data;
   }
+  // Troca o deviceCode aprovado por credenciais definitivas do no.
+  async function finishLink(deviceCode, generation) {
+    const poll = await api('/auth/device-code/poll', { deviceCode });
+    if (poll.status !== 'success') return false;
+    const login = await api('/auth/qr-login', { linkToken: poll.token });
+    const registered = await api('/nodes', { deviceName: 'HiveDocker', visibility, installationId: config.installationId }, login.token);
+    if (generation !== authGeneration) throw new Error('Vínculo cancelado');
+    if (!registered.tunnelSecret) throw new Error('Missing device credential');
+    config.nodeId = registered.node.id; config.tunnelSecret = registered.tunnelSecret; save();
+    pending = null;
+    start();
+    return true;
+  }
+  // Pede um codigo de vinculo sozinho e repete no log ate alguem aprovar.
+  // Assim o codigo aparece em `docker logs` sem precisar abrir o painel local.
+  async function autoLink() {
+    clearTimeout(autoTimer);
+    if (config.nodeId || process.env.AUTO_LINK === 'false') return;
+    const generation = authGeneration;
+    const retry = seconds => { autoTimer = setTimeout(autoLink, seconds * 1000); };
+    try {
+      if (!pending || pending.expiresAt <= Date.now()) {
+        const created = await api('/auth/device-code/generate', { type: visibility === 'PUBLIC' ? 'miner' : 'proxy' });
+        pending = { ...created, expiresAt: Date.now() + (created.expiresIn || 300) * 1000 };
+        const message = `CODIGO DE VINCULO: ${pending.userCode} — aprove em ${webBase}/dashboard/admin/device-approve (vale ${Math.round((created.expiresIn || 300) / 60)} min)`;
+        log(message);
+        console.log(message);
+      }
+      if (await finishLink(pending.deviceCode, generation)) {
+        log('Aparelho vinculado');
+        console.log('Aparelho vinculado com sucesso.');
+        return;
+      }
+      retry(5);
+    } catch (error) {
+      if (error.message === 'Vínculo cancelado') return;
+      pending = null;
+      log(`Falha ao pedir codigo de vinculo: ${error.message}`);
+      console.log(`Falha ao pedir codigo de vinculo: ${error.message}. Nova tentativa em 30s.`);
+      retry(30);
+    }
+  }
+  function stopAutoLink() { clearTimeout(autoTimer); pending = null; }
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '16kb' }));
@@ -123,7 +169,11 @@ function createNode(options = {}) {
   app.get('/api/status', (_req, res) => res.json(status()));
   app.post('/api/tunnel/start', (_req, res) => { start(); res.json({ success: true }); });
   app.post('/api/tunnel/stop', (_req, res) => { stop(); res.json({ success: true }); });
-  app.post('/api/logout', (_req, res) => { authGeneration++; stop(); delete config.nodeId; delete config.tunnelSecret; delete config.token; delete config.linkToken; save(); res.json({ success: true }); });
+  app.post('/api/logout', (_req, res) => { authGeneration++; stop(); stopAutoLink(); delete config.nodeId; delete config.tunnelSecret; delete config.token; delete config.linkToken; save(); res.json({ success: true }); autoLink(); });
+  app.get('/api/link-code', (_req, res) => res.json({ data: {
+    linked: Boolean(config.nodeId), userCode: pending?.userCode || null,
+    approveUrl: `${webBase}/dashboard/admin/device-approve`,
+    expiresInSeconds: pending ? Math.max(0, Math.round((pending.expiresAt - Date.now()) / 1000)) : 0 } }));
   app.post('/api/auth/start', async (_req, res) => {
     try { res.json({ success: true, data: await api('/auth/device-code/generate', { type: visibility === 'PUBLIC' ? 'miner' : 'proxy' }) }); }
     catch (error) { res.status(502).json({ error: error.message }); }
@@ -134,25 +184,21 @@ function createNode(options = {}) {
     const generation = authGeneration;
     try {
       if (config.nodeId) return res.json({ data: { status: 'success' } });
-      const poll = await api('/auth/device-code/poll', { deviceCode: req.body.deviceCode });
-      if (poll.status !== 'success') return res.json({ data: { status: 'pending' } });
-      const login = await api('/auth/qr-login', { linkToken: poll.token });
-      const registered = await api('/nodes', { deviceName: 'HiveDocker', visibility, installationId: config.installationId }, login.token);
-      if (generation !== authGeneration) return res.status(409).json({ error: 'Vínculo cancelado' });
-      if (!registered.tunnelSecret) throw new Error('Missing device credential');
-      config.nodeId = registered.node.id; config.tunnelSecret = registered.tunnelSecret; save(); start();
+      if (!await finishLink(req.body.deviceCode, generation)) return res.json({ data: { status: 'pending' } });
+      clearTimeout(autoTimer);
       res.json({ data: { status: 'success' } });
     } catch (error) { res.status(502).json({ error: error.message }); }
     finally { pollBusy = false; }
   });
-  return { app, start, stop, status, panelToken: config.panelToken };
+  return { app, start, stop, status, autoLink, stopAutoLink, panelToken: config.panelToken };
 }
 if (require.main === module) {
   const node = createNode();
   const server = node.app.listen(Number(process.env.PORT || 8080), process.env.HOST || '127.0.0.1', () => {
     console.log('HiveDocker ready. Panel token is stored in data/config.json (or PANEL_TOKEN).');
     node.start();
+    node.autoLink();
   });
-  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { node.stop(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); });
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { node.stop(); node.stopAutoLink(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); });
 }
 module.exports = { createNode };

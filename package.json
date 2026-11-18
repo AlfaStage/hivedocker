@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test server.test.js"
+    "test": "node --test server.test.js",
+    "link": "node link.js"
   },
   "dependencies": {
     "express": "^4.18.2",
