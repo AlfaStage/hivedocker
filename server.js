@@ -33,7 +33,7 @@ function createNode(options = {}) {
   let autoTimer = null;
   const resolveDestination = options.resolveTarget || resolveTarget;
   const logs = [];
-  function log(message) { logs.unshift({ time: new Date().toISOString(), message }); logs.splice(50); }
+  function log(message) { logs.unshift({ time: new Date().toISOString(), message }); logs.splice(50); console.log(message); }
   function send(s, payload) {
     if (s.ws.readyState === WebSocket.OPEN) s.ws.send(typeof payload === 'object' && !Buffer.isBuffer(payload) ? JSON.stringify(payload) : payload);
   }
@@ -139,19 +139,16 @@ function createNode(options = {}) {
         pending = { ...created, expiresAt: Date.now() + (created.expiresIn || 300) * 1000 };
         const message = `CODIGO DE VINCULO: ${pending.userCode} — aprove em ${webBase}/dashboard/admin/device-approve (vale ${Math.round((created.expiresIn || 300) / 60)} min)`;
         log(message);
-        console.log(message);
       }
       if (await finishLink(pending.deviceCode, generation)) {
-        log('Aparelho vinculado');
-        console.log('Aparelho vinculado com sucesso.');
+        log('Aparelho vinculado com sucesso');
         return;
       }
       retry(5);
     } catch (error) {
       if (error.message === 'Vínculo cancelado') return;
       pending = null;
-      log(`Falha ao pedir codigo de vinculo: ${error.message}`);
-      console.log(`Falha ao pedir codigo de vinculo: ${error.message}. Nova tentativa em 30s.`);
+      log(`Falha ao pedir codigo de vinculo: ${error.message}. Nova tentativa em 30s`);
       retry(30);
     }
   }
